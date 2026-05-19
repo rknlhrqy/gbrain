@@ -256,6 +256,71 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
         await engine.connect(toCfgSchema(cfgSchema));
         await engine.initSchema();
         console.log('  Schema up to date.');
+
+        // v0.32.3 search-lite mode banner. One-shot: fires at most once per
+        // install (state persisted via `search.mode_upgrade_notice_shown`).
+        // Reframes from "behavior is regressing" to "named modes available"
+        // per [CDX-1+2+3]: the production query op still defaults expand=true
+        // and limit=20 — Garry's behavior is NOT regressing.
+        try {
+          const shown = await engine.getConfig('search.mode_upgrade_notice_shown');
+          const existingMode = await engine.getConfig('search.mode');
+          if (shown !== 'true' && !existingMode) {
+            console.log('');
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('[gbrain] v0.32.3 added named search modes (conservative/balanced/tokenmax).');
+            console.log('[gbrain] Your current behavior is unchanged — the `query` op still defaults');
+            console.log('[gbrain] expand=true and limit=20, same as v0.31.x.');
+            console.log('═══════════════════════════════════════════════════════════════');
+            console.log('');
+            console.log('[AGENT] Relay this matrix to your operator and ask which mode they want.');
+            console.log('[AGENT] Recommended default: tokenmax (preserves current retrieval shape).');
+            console.log('[AGENT] Run `gbrain config set search.mode <mode>` after they decide.');
+            console.log('');
+            console.log('Per-query cost @ 10K queries/mo (typical single-user volume):');
+            console.log('');
+            console.log('                  Haiku 4.5    Sonnet 4.6   Opus 4.7');
+            console.log('                  ($1/M)       ($3/M)       ($5/M)');
+            console.log('  conservative    $40/mo       $120/mo      $200/mo');
+            console.log('  balanced        $100/mo      $300/mo      $500/mo');
+            console.log('  tokenmax        $200/mo      $600/mo      $1,000/mo');
+            console.log('');
+            console.log('  (scales linearly — multiply by 10 for 100K/mo)');
+            console.log('  25x corner-to-corner spread. Natural diagonal pairings span ~4x.');
+            console.log('');
+            console.log('To pick:');
+            console.log('  gbrain search modes              # see what is running');
+            console.log('  gbrain config set search.mode <conservative|balanced|tokenmax>');
+            console.log('  gbrain search tune               # data-driven recommendations');
+            console.log('');
+            console.log('tokenmax bumps limit to 50 (current default is 20). To preserve');
+            console.log('your EXACT current shape:');
+            console.log('  gbrain config set search.mode tokenmax');
+            console.log('  gbrain config set search.searchLimit 20');
+            console.log('');
+            await engine.setConfig('search.mode_upgrade_notice_shown', 'true');
+          }
+        } catch {
+          // Banner is cosmetic; never block the upgrade.
+        }
+
+        // v0.32.7 CJK wave: chunker-version bump → re-embed sweep.
+        // Idempotent — `runReindex` short-circuits when no pages are pending.
+        try {
+          const { runPostUpgradeReembedPrompt } = await import('../core/post-upgrade-reembed.ts');
+          const { getEmbeddingModel } = await import('../core/ai/gateway.ts');
+          let modelString = 'openai:text-embedding-3-large';
+          try { modelString = getEmbeddingModel(); } catch { /* gateway not configured — keep default */ }
+          const promptResult = await runPostUpgradeReembedPrompt(engine, modelString);
+          if (promptResult.proceeded) {
+            const { runReindex } = await import('./reindex.ts');
+            await runReindex(engine, ['--markdown']);
+          }
+        } catch (re) {
+          const msg = re instanceof Error ? re.message : String(re);
+          console.warn(`\nChunker-bump reindex skipped: ${msg}`);
+          console.warn('Run `gbrain reindex --markdown` manually when ready.');
+        }
       } finally {
         try { await engine.disconnect(); } catch { /* best-effort */ }
       }
@@ -277,6 +342,80 @@ export async function runPostUpgrade(args: string[] = []): Promise<void> {
     printAdvisoryIfRecommended({ version: VERSION, context: 'upgrade' });
   } catch {
     // Best-effort cosmetic surface; never block post-upgrade.
+  }
+
+  // v0.36 DX: skillpack reference sweep. After an upgrade, the gbrain bundle
+  // may have shipped changes to scaffolded skills the host already has on
+  // disk. Run `reference --all` automatically and print a one-line-per-skill
+  // summary so the agent + operator see what drifted without manually
+  // running the sweep. Skipped silently when:
+  //   - GBRAIN_SKIP_REFERENCE_SWEEP=1 in env
+  //   - no target workspace can be auto-detected (gbrain installed but
+  //     never scaffolded anywhere)
+  //   - the detected workspace IS the gbrain repo (dev-mode, would just
+  //     compare gbrain against itself)
+  //   - every scaffolded skill is identical (nothing to say)
+  await postUpgradeReferenceSweep();
+}
+
+/**
+ * Run `reference --all` against the auto-detected host workspace and print
+ * a one-line-per-skill summary of any drift. Best-effort; failures are
+ * swallowed so a broken sweep never blocks post-upgrade.
+ *
+ * Exported (with optional `opts` test seam) for unit testing the gate
+ * logic + output shape. Production callers pass no args — both paths are
+ * auto-detected.
+ */
+export async function postUpgradeReferenceSweep(
+  opts: { gbrainRoot?: string; targetWorkspace?: string } = {},
+): Promise<void> {
+  if (process.env.GBRAIN_SKIP_REFERENCE_SWEEP) return;
+  try {
+    const { autoDetectSkillsDirReadOnly } = await import('../core/repo-root.ts');
+    const { findGbrainRoot } = await import('../core/skillpack/bundle.ts');
+    const { runReferenceAll } = await import('../core/skillpack/reference.ts');
+    const path = await import('path');
+
+    // Allow tests to inject; default to auto-detection.
+    let targetWorkspace = opts.targetWorkspace;
+    if (!targetWorkspace) {
+      const detected = autoDetectSkillsDirReadOnly();
+      if (!detected.dir) return;
+      targetWorkspace = path.resolve(detected.dir, '..');
+    }
+
+    const gbrainRoot = opts.gbrainRoot ?? findGbrainRoot();
+    if (!gbrainRoot) return;
+
+    // Dev-mode guard: the detected workspace IS the gbrain repo. Sweeping
+    // gbrain against itself is always identical — print nothing.
+    if (path.resolve(targetWorkspace) === path.resolve(gbrainRoot)) return;
+
+    const result = runReferenceAll({ gbrainRoot, targetWorkspace });
+    // Print only skills that (a) the host has actually scaffolded, AND
+    // (b) have at least one differs or missing entry. Pure-`missing`
+    // skills the host never scaffolded are noise; skip them.
+    const drifted = result.skills.filter(
+      s =>
+        s.summary.identical + s.summary.differs > 0 &&
+        (s.summary.differs > 0 || s.summary.missing > 0),
+    );
+    if (drifted.length === 0) return;
+
+    console.log('');
+    console.log('Skillpack reference sweep (post-upgrade):');
+    for (const s of drifted) {
+      console.log(
+        `  ${s.slug.padEnd(40)} differs:${s.summary.differs} missing:${s.summary.missing}`,
+      );
+    }
+    console.log('');
+    console.log(
+      'Run `gbrain skillpack reference <slug>` to inspect per-skill diffs.\nSee `skills/_AGENT_README.md` for what your agent should do on update.\nSkip this sweep: `GBRAIN_SKIP_REFERENCE_SWEEP=1`.',
+    );
+  } catch {
+    // Best-effort. Never block post-upgrade.
   }
 }
 

@@ -27,7 +27,7 @@ for (const op of operations) {
 }
 
 // CLI-only commands that bypass the operation layer
-const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget']);
+const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'agent', 'apply-migrations', 'skillpack-check', 'skillpack', 'resolvers', 'integrity', 'repair-jsonb', 'orphans', 'sources', 'mounts', 'dream', 'check-resolvable', 'routing-eval', 'skillify', 'smoke-test', 'providers', 'storage', 'repos', 'code-def', 'code-refs', 'reindex-code', 'reindex-frontmatter', 'code-callers', 'code-callees', 'frontmatter', 'auth', 'friction', 'claw-test', 'book-mirror', 'takes', 'think', 'salience', 'anomalies', 'transcripts', 'models', 'remote', 'recall', 'forget', 'edges-backfill', 'cache', 'founder']);
 // CLI-only commands whose handlers print their own --help text. These are
 // excluded from the generic short-circuit so detailed per-command and
 // per-subcommand usage stays reachable.
@@ -38,6 +38,7 @@ const CLI_ONLY_SELF_HELP = new Set([
   'integrations', 'friction',
   'frontmatter', 'check-resolvable',
   'models',
+  'cache',
 ]);
 
 async function main() {
@@ -513,7 +514,11 @@ async function makeContext(engine: BrainEngine, params: Record<string, unknown>)
     // confinement (e.g., cwd-locked file_upload).
     remote: false,
     cliOpts: getCliOptions(),
-    ...(sourceId ? { sourceId } : {}),
+    // v0.34 D4: sourceId is REQUIRED at the type level. Fall back to 'default'
+    // when resolveSourceId returned undefined (fresh pre-init brain, no sources
+    // table). Matches dispatch.ts's auto-fill so the contract holds across
+    // every transport.
+    sourceId: sourceId ?? 'default',
   };
 }
 
@@ -640,6 +645,13 @@ const THIN_CLIENT_REFUSED_COMMANDS = new Set([
   // hint pointing at the routable MCP tools; per-subcommand splits are
   // a v0.31.x follow-up TODO.
   'takes', 'sources',
+  // v0.32 thin-client routing audit (Codex round 2 findings #2, #4):
+  // - `pages` purge-deleted is admin+localOnly (operations.ts:856-864)
+  // - `files` list / file_url MCP ops are localOnly (operations.ts:1769-1879)
+  // - `eval` export/prune/replay have no MCP equivalents
+  // - `code-def`/`code-refs`/`code-callers`/`code-callees` have NO MCP ops
+  //   in operations.ts:2630-2671; cannot be "fixed by routing" yet
+  'pages', 'files', 'eval', 'code-def', 'code-refs', 'code-callers', 'code-callees',
 ]);
 
 /**
@@ -667,6 +679,14 @@ const THIN_CLIENT_REFUSE_HINTS: Record<string, string> = {
   storage: 'storage operates on the local repo on disk. Run on the host.',
   takes: 'takes mutate subcommands edit local .md files; routing the read subcommands lands in v0.31.x. For now: use `takes_list` and `takes_search` MCP tools from your agent, or run on the host.',
   sources: 'sources commands manage local DB + config rows. Per-subcommand thin-client routing lands in v0.31.x. For now: use `sources_list` / `sources_status` MCP tools, or run on the host.',
+  // v0.32 audit additions
+  pages: '`pages purge-deleted` is admin+localOnly (hard-deletes from the local DB). Run on the host.',
+  files: '`files list` and `files url` MCP ops are localOnly (paths live on the host filesystem). Use `gbrain files` on the host machine.',
+  eval: '`eval` export/prune/replay touch the local engine and have no MCP equivalents. Run `gbrain eval` on the host.',
+  'code-def': '`code-def` needs symbol-aware lookup that has no MCP op yet. Run on the host or use `search` from your agent with a symbol-shaped query.',
+  'code-refs': '`code-refs` has no MCP op yet. Run on the host.',
+  'code-callers': '`code-callers` has no MCP op yet. Run on the host.',
+  'code-callees': '`code-callees` has no MCP op yet. Run on the host.',
 };
 
 /**
@@ -790,6 +810,14 @@ async function handleCliOnly(command: string, args: string[]) {
     // connect mount engines lazily on first use by op dispatch.
     const { runMounts } = await import('./commands/mounts.ts');
     await runMounts(args);
+    return;
+  }
+  if (command === 'cache') {
+    // v0.32.x search-lite: semantic query cache management. Dispatch the
+    // subcommand handler (stats / clear / prune); the handler opens its
+    // own engine connection.
+    const { runCache } = await import('./commands/cache.ts');
+    await runCache(args);
     return;
   }
   if (command === 'routing-eval') {
@@ -936,10 +964,36 @@ async function handleCliOnly(command: string, args: string[]) {
   // v0.28.8: longmemeval brings its own in-memory PGLite. Bypassing
   // connectEngine here keeps `gbrain eval longmemeval --help` and benchmark
   // runs working on machines that have no `~/.gbrain/config.json` configured.
+  //
+  // v0.35.1.1: still need to configureGateway() so the in-memory brain's
+  // import + hybridSearch can embed via the configured provider. Reads
+  // ~/.gbrain/config.json when present; falls back to env vars otherwise
+  // (GBRAIN_EMBEDDING_MODEL / GBRAIN_EMBEDDING_DIMENSIONS).
   if (command === 'eval' && args[0] === 'longmemeval') {
     const { runEvalLongMemEval } = await import('./commands/eval-longmemeval.ts');
+    if (!(args.length > 1 && (args[1] === '--help' || args[1] === '-h'))) {
+      const config = loadConfig() ?? ({
+        embedding_model: process.env.GBRAIN_EMBEDDING_MODEL,
+        embedding_dimensions: process.env.GBRAIN_EMBEDDING_DIMENSIONS
+          ? Number(process.env.GBRAIN_EMBEDDING_DIMENSIONS) : undefined,
+      } as GBrainConfig);
+      const { configureGateway } = await import('./core/ai/gateway.ts');
+      configureGateway(buildGatewayConfig(config));
+    }
     await runEvalLongMemEval(args.slice(1));
     return;
+  }
+
+  // v0.33.1.3: `gbrain eval whoknows` on thin-client installs bypasses
+  // connectEngine entirely — the eval routes per-query through the remote
+  // `find_experts` MCP op (the v0.31.1 routing seam). Local mode falls
+  // through to the engine-connected path below.
+  if (command === 'eval' && args[0] === 'whoknows') {
+    const cfgPre = loadConfig();
+    if (isThinClient(cfgPre)) {
+      const { runEvalWhoknows } = await import('./commands/eval-whoknows.ts');
+      process.exit(await runEvalWhoknows(null, args.slice(1)));
+    }
   }
 
   // All remaining CLI-only commands need a DB connection
@@ -1056,6 +1110,12 @@ async function handleCliOnly(command: string, args: string[]) {
         await runOrphans(engine, args);
         break;
       }
+      // v0.32.7 CJK wave — post-upgrade markdown re-chunk sweep.
+      case 'reindex': {
+        const { runReindex } = await import('./commands/reindex.ts');
+        await runReindex(engine, args);
+        break;
+      }
       // v0.29 — Salience + Anomaly Detection
       case 'salience': {
         const { runSalience } = await import('./commands/salience.ts');
@@ -1065,6 +1125,23 @@ async function handleCliOnly(command: string, args: string[]) {
       case 'anomalies': {
         const { runAnomalies } = await import('./commands/anomalies.ts');
         await runAnomalies(engine, args);
+        break;
+      }
+      case 'edges-backfill': {
+        // v0.34 W6 — operator escape hatch for the symbol-resolution backfill.
+        // Resumable via the edges_backfilled_at watermark; per-batch transactions
+        // commit so Ctrl-C leaves a clean resumable state.
+        const { runEdgesBackfill } = await import('./commands/edges-backfill.ts');
+        await runEdgesBackfill(engine, args);
+        break;
+      }
+      case 'whoknows': {
+        // v0.33 (Issue #?): expertise + relationship-proximity routing.
+        // MCP op `find_experts` (read-scoped) backs the same code path; CLI
+        // dispatch here is the user-facing surface. Thin-client routing
+        // happens inside runWhoknows via isThinClient(cfg) (v0.31.1 pattern).
+        const { runWhoknows } = await import('./commands/whoknows.ts');
+        await runWhoknows(engine, args);
         break;
       }
       case 'transcripts': {
@@ -1077,9 +1154,24 @@ async function handleCliOnly(command: string, args: string[]) {
         await runModels(engine, args);
         break;
       }
+      case 'search': {
+        // v0.32.3 search-lite — `gbrain search modes/stats/tune`.
+        const { runSearch } = await import('./commands/search.ts');
+        await runSearch(engine, args);
+        break;
+      }
       case 'takes': {
         const { runTakes } = await import('./commands/takes.ts');
         await runTakes(engine, args);
+        break;
+      }
+      case 'founder': {
+        // v0.35.4 (T7) — founder scorecard. `gbrain founder scorecard <slug>`
+        // rolls up Phase 2's typed-claim substrate into the four scorecard
+        // metrics (claim accuracy, consistency, growth trajectory, red flags).
+        // Thin-client routing handled inside the command file.
+        const { runFounder } = await import('./commands/founder-scorecard.ts');
+        await runFounder(engine, args);
         break;
       }
       case 'think': {

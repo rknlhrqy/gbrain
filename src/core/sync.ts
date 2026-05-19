@@ -11,6 +11,8 @@
  *   pathToSlug()  →  convert file paths to page slugs
  */
 
+import { CJK_SLUG_CHARS } from './cjk.ts';
+
 export interface SyncManifest {
   added: string[];
   modified: string[];
@@ -207,6 +209,47 @@ function matchesAnyGlob(path: string, patterns?: string[]): boolean {
 }
 
 /**
+ * Directory names that walkers must NEVER descend into. Used at descent
+ * time (before recursion) to prune entire subtrees — saves the IO cost of
+ * walking thousands of vendor / generated / hidden files only to filter
+ * them at file-emit time. Used by every walker in gbrain (sync, extract,
+ * transcript-discovery, etc.).
+ *
+ * Pattern: dirname matching at single path-segment granularity. Walkers
+ * call `pruneDir(entry.name)` on each subdirectory before recursing.
+ *
+ * `node_modules` lacks a leading dot so the dot-prefix exclusion in
+ * isSyncable below doesn't catch it; explicit entry here closes the
+ * latent walker bug (#923, #202).
+ */
+const PRUNE_DIR_NAMES = new Set<string>([
+  'node_modules',
+  '.raw',
+  'ops',
+]);
+
+/**
+ * Should this directory be descended into? Returns `false` for vendor / hidden /
+ * generated dirs that walkers should skip BEFORE recursing. Catches
+ * `node_modules` (latent bug — no leading dot), dot-prefix dirs (`.git`,
+ * `.obsidian`, `.raw`, `.cache`, etc. via the leading-dot heuristic), and the
+ * explicit `PRUNE_DIR_NAMES` set above.
+ *
+ * `name` is a single path segment (basename of the directory entry), NOT a
+ * full path. Walkers consult this on each subdirectory entry during recursion.
+ */
+export function pruneDir(name: string): boolean {
+  if (!name) return true;
+  if (name.startsWith('.')) return false;
+  if (PRUNE_DIR_NAMES.has(name)) return false;
+  // `.raw` is the literal directory name; `*.raw` is the gbrain sidecar
+  // convention (e.g. `people/pedro.raw/` holds raw source for pedro.md).
+  // Both forms should be skipped at descent time.
+  if (name.endsWith('.raw')) return false;
+  return true;
+}
+
+/**
  * Filter a file path to determine if it should be synced to GBrain.
  * Strategy-aware: 'markdown' (default) = .md/.mdx only, 'code' = code files only, 'auto' = both.
  */
@@ -215,19 +258,16 @@ export function isSyncable(path: string, opts: SyncableOptions = {}): boolean {
 
   if (!isAllowedByStrategy(path, strategy)) return false;
 
-  // Skip hidden directories
-  if (path.split('/').some(p => p.startsWith('.'))) return false;
-
-  // Skip .raw/ sidecar directories
-  if (path.includes('.raw/')) return false;
+  // Skip every path segment that pruneDir would block walkers from descending
+  // into. Catches hidden dirs (`.git`, `.obsidian`), `.raw/` sidecars,
+  // `node_modules/` (latent bug fix), and `ops/` at any depth.
+  const segments = path.split('/');
+  if (segments.some(p => !pruneDir(p))) return false;
 
   // Skip meta files that aren't pages
   const skipFiles = ['schema.md', 'index.md', 'log.md', 'README.md'];
-  const basename = path.split('/').pop() || '';
+  const basename = segments[segments.length - 1] || '';
   if (skipFiles.includes(basename)) return false;
-
-  // Skip ops/ directory
-  if (path.startsWith('ops/')) return false;
 
   if (opts.include && opts.include.length > 0 && !matchesAnyGlob(path, opts.include)) return false;
   if (opts.exclude && opts.exclude.length > 0 && matchesAnyGlob(path, opts.exclude)) return false;
@@ -246,17 +286,23 @@ export function isSyncable(path: string, opts: SyncableOptions = {}): boolean {
  * Pattern is the inner character class only (no anchors); callers wrap it
  * in `^...$` or compose it with prefixes like `(?:people|companies)/...`.
  */
-export const SLUG_SEGMENT_PATTERN = /[a-z0-9._-]+/;
+export const SLUG_SEGMENT_PATTERN = new RegExp(`[a-z0-9._\\-${CJK_SLUG_CHARS}]+`);
 
 /**
  * Slugify a single path segment: lowercase, strip special chars, spaces → hyphens.
+ * CJK ranges (Han / Hiragana / Katakana / Hangul Syllables) are preserved (v0.32.7).
+ * NFC re-normalize after the NFD-strip-accents pass so Hangul Jamo recomposes back
+ * into precomposed syllables that fall inside the whitelist.
  */
+const SLUGIFY_KEEP_RE = new RegExp(`[^a-z0-9.\\s_\\-${CJK_SLUG_CHARS}]`, 'g');
+
 export function slugifySegment(segment: string): string {
   return segment
     .normalize('NFD')                     // Decompose accented chars
     .replace(/[\u0300-\u036f]/g, '')      // Strip accent marks
+    .normalize('NFC')                     // Recompose Hangul Jamo back to Syllables (v0.32.7)
     .toLowerCase()
-    .replace(/[^a-z0-9.\s_-]/g, '')      // Keep alphanumeric, dots, spaces, underscores, hyphens
+    .replace(SLUGIFY_KEEP_RE, '')         // Keep alnum, dots, spaces, _-, and CJK (v0.32.7)
     .replace(/[\s]+/g, '-')              // Spaces → hyphens
     .replace(/-+/g, '-')                 // Collapse multiple hyphens
     .replace(/^-|-$/g, '');              // Strip leading/trailing hyphens

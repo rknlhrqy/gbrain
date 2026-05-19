@@ -10,7 +10,15 @@ start here.
 2. Install: `bun install`
 3. Init the brain: `gbrain init` (defaults to PGLite, zero-config). For 1000+ files or
    multi-machine sync, init suggests Postgres + pgvector via Supabase.
-4. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full 9-step flow
+4. **STOP — ask the user about search mode.** `gbrain init` auto-applied a
+   default but printed a 9-cell cost matrix (mode × downstream model)
+   preceded by `[AGENT]` markers. You MUST relay the matrix to the operator
+   and confirm their choice before continuing. Cost spread between corners
+   is 25x — silent acceptance is the wrong default. See
+   [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) Step 3.5 for the
+   exact ask-the-user protocol. Same banner fires on `gbrain post-upgrade`
+   for existing users (search modes were added in v0.32.3).
+5. Read [`./INSTALL_FOR_AGENTS.md`](./INSTALL_FOR_AGENTS.md) for the full 9-step flow
    (API keys, identity, cron, verification).
 
 ## Read this order
@@ -51,6 +59,14 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   <dataset.jsonl>` (v0.28.8) runs against an isolated in-memory PGLite
   per question — your `~/.gbrain` is never opened. Full guide:
   [`docs/eval-bench.md`](./docs/eval-bench.md).
+- **Track a founder/company over time (v0.35.7):** when an entity has
+  typed metric claims in its `## Facts` fence (`metric: mrr`, `value: 50000`,
+  `unit: USD`, `period: monthly` columns), run
+  `gbrain eval trajectory <entity-slug>` for the chronological history
+  with regressions auto-flagged, or `gbrain founder scorecard <entity-slug>`
+  for a four-signal JSON rollup (claim_accuracy / consistency /
+  growth_trajectory / red_flags). MCP op `find_trajectory` exposes the
+  same data — read scope, visibility-filtered for remote callers.
 - **Everything else:** [`./llms.txt`](./llms.txt) is the full documentation map.
   [`./llms-full.txt`](./llms-full.txt) is the same map with core docs inlined for
   single-fetch ingestion.

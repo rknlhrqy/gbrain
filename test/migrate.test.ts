@@ -719,6 +719,173 @@ describe('migrate — runner behavioral (v14 handler + v15 backfill)', () => {
   });
 });
 
+// ────────────────────────────────────────────────────────────────────────
+// v0.33.4 D6 — migration v66 (embed_stale_partial_index)
+// Mirrors v14's CONCURRENTLY + invalid-remnant pattern for the
+// content_chunks partial index. Verifies both the source shape and the
+// actual schema state post-migration on PGLite.
+// ────────────────────────────────────────────────────────────────────────
+
+describe('migrate v66 — embed_stale_partial_index (D6)', () => {
+  const v66 = MIGRATIONS.find(m => m.version === 66);
+
+  test('v66 exists and uses a handler (engine-aware branching, mirrors v14)', () => {
+    expect(v66).toBeDefined();
+    expect(v66!.name).toBe('embed_stale_partial_index');
+    expect(typeof v66!.handler).toBe('function');
+    expect(v66!.sql).toBe('');
+  });
+
+  test('v66 handler source: CONCURRENTLY + invalid-index cleanup on Postgres branch', async () => {
+    const { readFileSync } = await import('fs');
+    const src = readFileSync('src/core/migrate.ts', 'utf-8');
+    const v66Start = src.indexOf("name: 'embed_stale_partial_index'");
+    expect(v66Start).toBeGreaterThan(-1);
+    const v66Block = src.slice(v66Start, v66Start + 3000);
+    expect(v66Block).toContain('pg_index');
+    expect(v66Block).toContain('indisvalid');
+    expect(v66Block).toContain('DROP INDEX CONCURRENTLY IF EXISTS idx_chunks_embedding_null');
+    expect(v66Block).toContain('CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_chunks_embedding_null');
+    // Partial index predicate must match the production query in
+    // postgres-engine.ts / pglite-engine.ts: `WHERE embedding IS NULL`.
+    expect(v66Block).toContain('WHERE embedding IS NULL');
+    // DROP IF EXISTS must precede CREATE IF NOT EXISTS so a failed prior
+    // CONCURRENTLY build is cleaned before re-create.
+    const dropIdx = v66Block.indexOf('DROP INDEX CONCURRENTLY IF EXISTS');
+    const createIdx = v66Block.indexOf('CREATE INDEX CONCURRENTLY IF NOT EXISTS');
+    expect(dropIdx).toBeLessThan(createIdx);
+    // Branches on engine.kind (handler-pattern from v14).
+    expect(v66Block).toContain('engine.kind');
+  });
+
+  test('v66 idempotent flag is true (re-run safety)', () => {
+    expect(v66!.idempotent).toBe(true);
+  });
+});
+
+describe('migrate runner v66 — partial index materialized on PGLite', () => {
+  let engine: PGLiteEngine;
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+  });
+
+  afterAll(async () => {
+    await engine.disconnect();
+  });
+
+  test('v66 created idx_chunks_embedding_null on PGLite via handler branch', async () => {
+    const rows = await (engine as any).db.query(
+      `SELECT indexname FROM pg_indexes WHERE indexname = 'idx_chunks_embedding_null'`
+    );
+    expect(rows.rows.length).toBe(1);
+  });
+});
+
+// ────────────────────────────────────────────────────────────────────────
+// v0.35.4 — migration v67 (facts_typed_claim_columns)
+// Adds four optional typed-claim columns to `facts` + a partial index
+// keyed on (entity_slug, claim_metric, valid_from) WHERE claim_metric IS NOT NULL.
+// All fields nullable; the migration is metadata-only on both engines
+// because no DEFAULT is set and the partial index covers zero rows until
+// extraction emits typed fields.
+// ────────────────────────────────────────────────────────────────────────
+
+describe('migrate v67 — facts_typed_claim_columns', () => {
+  const v67 = MIGRATIONS.find(m => m.version === 67);
+
+  test('v67 exists and uses an inline sql field (no handler needed)', () => {
+    expect(v67).toBeDefined();
+    expect(v67!.name).toBe('facts_typed_claim_columns');
+    expect(v67!.idempotent).toBe(true);
+    expect(typeof v67!.sql).toBe('string');
+    expect((v67!.sql as string).length).toBeGreaterThan(0);
+  });
+
+  test('v67 sql adds all four typed-claim columns', () => {
+    const sql = v67!.sql as string;
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS claim_metric');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS claim_value');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS claim_unit');
+    expect(sql).toContain('ADD COLUMN IF NOT EXISTS claim_period');
+    // DOUBLE PRECISION is the numeric type for claim_value (per plan D-CDX).
+    expect(sql).toContain('DOUBLE PRECISION');
+  });
+
+  test('v67 creates partial index on (entity_slug, claim_metric, valid_from)', () => {
+    const sql = v67!.sql as string;
+    expect(sql).toContain('CREATE INDEX IF NOT EXISTS facts_typed_claim_idx');
+    expect(sql).toContain('ON facts (entity_slug, claim_metric, valid_from)');
+    expect(sql).toContain('WHERE claim_metric IS NOT NULL');
+  });
+});
+
+describe('migrate runner v67 — typed-claim columns materialized on PGLite', () => {
+  let engine: PGLiteEngine;
+
+  beforeAll(async () => {
+    engine = new PGLiteEngine();
+    await engine.connect({});
+    await engine.initSchema();
+  });
+
+  afterAll(async () => {
+    await engine.disconnect();
+  });
+
+  test('v67 added claim_metric, claim_value, claim_unit, claim_period columns to facts', async () => {
+    const rows = await (engine as any).db.query(
+      `SELECT column_name, data_type FROM information_schema.columns
+       WHERE table_name = 'facts'
+         AND column_name IN ('claim_metric', 'claim_value', 'claim_unit', 'claim_period')
+       ORDER BY column_name`,
+    );
+    const names = rows.rows.map((r: any) => r.column_name).sort();
+    expect(names).toEqual(['claim_metric', 'claim_period', 'claim_unit', 'claim_value']);
+    const byName: Record<string, string> = Object.fromEntries(
+      rows.rows.map((r: any) => [r.column_name, r.data_type]),
+    );
+    // claim_value is DOUBLE PRECISION; the others are TEXT.
+    expect(byName['claim_value']).toBe('double precision');
+    expect(byName['claim_metric']).toBe('text');
+    expect(byName['claim_unit']).toBe('text');
+    expect(byName['claim_period']).toBe('text');
+  });
+
+  test('v67 created facts_typed_claim_idx partial index on PGLite', async () => {
+    const rows = await (engine as any).db.query(
+      `SELECT indexname, indexdef FROM pg_indexes WHERE indexname = 'facts_typed_claim_idx'`,
+    );
+    expect(rows.rows.length).toBe(1);
+    // The partial-predicate appears in the materialized index definition.
+    expect(rows.rows[0].indexdef).toContain('claim_metric');
+  });
+
+  test('v67 columns are nullable — existing facts persist with NULL typed fields (backward compat)', async () => {
+    // Insert a fact via raw SQL with no typed-claim values; assert the
+    // four columns remain NULL. The cycle path (extract_facts) hits this
+    // backward-compat surface every time it processes a fence without
+    // metric assertions.
+    const db = (engine as any).db;
+    await db.exec(`INSERT INTO sources (id, name) VALUES ('v67-test', 'v67-test') ON CONFLICT DO NOTHING`);
+    await db.exec(
+      `INSERT INTO facts (source_id, entity_slug, fact, source, valid_from)
+       VALUES ('v67-test', 'v67/example', 'plain non-typed claim', 'test', now())`,
+    );
+    const row = await db.query(
+      `SELECT claim_metric, claim_value, claim_unit, claim_period
+       FROM facts WHERE source_id = 'v67-test' AND entity_slug = 'v67/example'`,
+    );
+    expect(row.rows.length).toBe(1);
+    expect(row.rows[0].claim_metric).toBeNull();
+    expect(row.rows[0].claim_value).toBeNull();
+    expect(row.rows[0].claim_unit).toBeNull();
+    expect(row.rows[0].claim_period).toBeNull();
+  });
+});
+
 describe('migrate: v8 (links_dedup) regression — must be fast on 1K duplicate rows', () => {
   let engine: PGLiteEngine;
 
@@ -1306,6 +1473,61 @@ describe('migration v49 — eval_takes_quality_runs (v0.32)', () => {
 
   test('LATEST_VERSION caught up to 49', () => {
     expect(LATEST_VERSION).toBeGreaterThanOrEqual(49);
+  });
+});
+
+describe('migration v51 — facts_fence_columns (v0.32.2)', () => {
+  // v0.32.2: facts become FS-canonical via the `## Facts` fence pattern
+  // (mirror of takes-fence). row_num + source_markdown_slug are the
+  // fence round-trip columns; the partial UNIQUE index enforces uniqueness
+  // only once row_num is assigned, leaving legacy NULL rows uncollided
+  // until the v0_32_2 orchestrator backfills them from entity-page fences.
+  test('exists with the expected name', () => {
+    const v51 = MIGRATIONS.find(m => m.version === 51);
+    expect(v51).toBeDefined();
+    expect(v51?.name).toBe('facts_fence_columns');
+  });
+
+  test('adds row_num + source_markdown_slug as ADD COLUMN IF NOT EXISTS', () => {
+    const v51 = MIGRATIONS.find(m => m.version === 51);
+    const sql = v51!.sql || '';
+    expect(sql).toContain('ALTER TABLE facts ADD COLUMN IF NOT EXISTS row_num');
+    expect(sql).toContain('ALTER TABLE facts ADD COLUMN IF NOT EXISTS source_markdown_slug');
+  });
+
+  test('row_num must be nullable (legacy v0.31 rows have no row_num until backfill)', () => {
+    const v51 = MIGRATIONS.find(m => m.version === 51);
+    const sql = v51!.sql || '';
+    // Both ALTERs land without `NOT NULL` — the orchestrator backfills before
+    // anything assumes presence. A future migration may tighten this once the
+    // backfill has run everywhere.
+    expect(sql).not.toMatch(/row_num\s+INTEGER\s+NOT NULL/);
+    expect(sql).not.toMatch(/source_markdown_slug\s+TEXT\s+NOT NULL/);
+  });
+
+  test('creates partial unique index keyed on (source_id, source_markdown_slug, row_num) WHERE row_num IS NOT NULL', () => {
+    const v51 = MIGRATIONS.find(m => m.version === 51);
+    const sql = v51!.sql || '';
+    expect(sql).toContain('CREATE UNIQUE INDEX IF NOT EXISTS idx_facts_fence_key');
+    expect(sql).toContain('ON facts (source_id, source_markdown_slug, row_num)');
+    expect(sql).toContain('WHERE row_num IS NOT NULL');
+  });
+
+  test('partial WHERE clause is the Codex R2 collision guard for legacy NULL rows', () => {
+    // Without the partial clause, two pre-v51 rows with NULL row_num on the
+    // same (source_id, source_markdown_slug) coordinate would collide and
+    // the migration would fail loudly on any populated v0.31 brain. The
+    // partial index makes legacy rows invisible to uniqueness checks until
+    // the v0_32_2 orchestrator gives them a row_num.
+    const v51 = MIGRATIONS.find(m => m.version === 51);
+    const sql = v51!.sql || '';
+    const indexClause = sql.match(/CREATE UNIQUE INDEX[\s\S]*?;/);
+    expect(indexClause).toBeTruthy();
+    expect(indexClause![0]).toContain('WHERE row_num IS NOT NULL');
+  });
+
+  test('LATEST_VERSION caught up to 51', () => {
+    expect(LATEST_VERSION).toBeGreaterThanOrEqual(51);
   });
 });
 

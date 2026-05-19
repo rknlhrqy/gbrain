@@ -54,7 +54,8 @@ import { getCliOptions, cliOptsToProgressOptions } from './cli-options.ts';
 // ─── Types ─────────────────────────────────────────────────────────
 
 export type CyclePhase =
-  | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract'
+  | 'lint' | 'backlinks' | 'sync' | 'synthesize' | 'extract' | 'extract_facts'
+  | 'resolve_symbol_edges'
   | 'patterns' | 'recompute_emotional_weight' | 'consolidate'
   | 'embed' | 'orphans' | 'purge';
 
@@ -64,6 +65,19 @@ export const ALL_PHASES: CyclePhase[] = [
   'sync',
   'synthesize',
   'extract',
+  // v0.32.2 — reconcile DB facts index from the `## Facts` fence on
+  // every affected entity page. Runs AFTER extract (link/timeline
+  // materialization) and BEFORE patterns (which reads graph state).
+  // The empty-fence guard refuses to run if pre-v51 legacy facts are
+  // pending the v0_32_2 backfill (Codex R2-#7).
+  'extract_facts',
+  // v0.33.3 W0c — within-file two-pass symbol resolution. Runs AFTER
+  // extract + extract_facts so any code edges sync emitted (still bare-token)
+  // get resolved into {resolved_chunk_id: N} / {ambiguous: true,
+  // candidates: [...]} edge_metadata entries before downstream phases read
+  // the graph. Quick-cycle compatible: each invocation walks at most
+  // BATCH_SIZE*10 chunks where edges_backfilled_at IS NULL or stale.
+  'resolve_symbol_edges',
   'patterns',
   // v0.29 — runs AFTER extract + synthesize so it sees the union of
   // sync-touched + synthesize-written pages with fresh tag + take state.
@@ -96,6 +110,10 @@ const NEEDS_LOCK_PHASES: ReadonlySet<CyclePhase> = new Set([
   'sync',
   'synthesize',
   'extract',
+  // v0.32.2 — wipes + re-inserts facts per affected page.
+  'extract_facts',
+  // v0.33.3 W0c — writes code_edges_symbol.edge_metadata + content_chunks.edges_backfilled_at.
+  'resolve_symbol_edges',
   'patterns',
   // v0.29 — writes pages.emotional_weight column.
   'recompute_emotional_weight',
@@ -163,6 +181,10 @@ export interface CycleReport {
     patterns_written: number;
     /** v0.29: number of pages whose emotional_weight was (re)computed. */
     pages_emotional_weight_recomputed: number;
+    /** v0.34: number of code edges resolved (1 candidate) by the resolve_symbol_edges phase. */
+    edges_resolved: number;
+    /** v0.34: number of code edges marked ambiguous (2+ candidates) by the resolve_symbol_edges phase. */
+    edges_ambiguous: number;
     /** v0.26.5: number of source rows hard-deleted by the purge phase. */
     purged_sources_count: number;
     /** v0.26.5: number of page rows hard-deleted by the purge phase. */
@@ -171,6 +193,26 @@ export interface CycleReport {
     facts_consolidated: number;
     /** v0.31: number of new takes created by the consolidate phase. */
     consolidate_takes_written: number;
+    /**
+     * v0.35.5: number of phantom unprefixed entity pages (e.g. `alice.md`)
+     * redirected to their canonical prefixed slugs (`people/alice-example`)
+     * by the phantom-redirect pre-pass inside `extract_facts`. Capped per
+     * cycle by `GBRAIN_PHANTOM_REDIRECT_LIMIT` (default 50).
+     */
+    phantoms_redirected: number;
+    /**
+     * v0.35.5: number of phantom pages skipped because their canonical
+     * resolved to multiple candidates. Operator must triage manually via
+     * the `~/.gbrain/audit/phantoms-YYYY-Www.jsonl` audit log.
+     */
+    phantoms_ambiguous: number;
+    /**
+     * v0.35.5: number of phantom pages skipped because the disk fence and
+     * DB body disagreed on the parsed fact row set, OR because the redirect
+     * commit phase failed mid-way and surfaces as drift on retry. Audit log
+     * records the specific reason.
+     */
+    phantoms_skipped_drift: number;
   };
 }
 
@@ -653,6 +695,150 @@ async function runPhaseExtract(
   }
 }
 
+async function runPhaseExtractFacts(
+  engine: BrainEngine,
+  brainDir: string | null,
+  sourceId: string,
+  dryRun: boolean,
+  changedSlugs?: string[],
+): Promise<PhaseResult> {
+  try {
+    const { runExtractFacts } = await import('./cycle/extract-facts.ts');
+    const result = await runExtractFacts(engine, {
+      slugs: changedSlugs,
+      dryRun,
+      sourceId,
+      brainDir: brainDir ?? undefined,
+    });
+
+    // Empty-fence guard: pre-v51 legacy rows pending the v0_32_2 backfill.
+    // Surface as 'warn' so doctor + the cycle report can see it; don't fail
+    // the cycle because the workaround is well-defined (run apply-migrations).
+    if (result.guardTriggered) {
+      return {
+        phase: 'extract_facts',
+        status: 'warn',
+        duration_ms: 0,
+        summary: `extract_facts skipped: ${result.legacyRowsPending} legacy v0.31 facts pending fence backfill`,
+        details: {
+          legacyRowsPending: result.legacyRowsPending,
+          hint: 'gbrain apply-migrations --yes',
+          warnings: result.warnings,
+        },
+      };
+    }
+
+    // v0.35.5: phantom-redirect counters bubble up alongside the existing
+    // fact-reconcile counts. We summarize the phantom counters in the
+    // human-readable summary line when any non-zero phantom work happened
+    // so the daily cycle report makes the cleanup visible.
+    const phantomSummary = (result.phantomsRedirected
+      || result.phantomsAmbiguous
+      || result.phantomsSkippedDrift)
+      ? `, ${result.phantomsRedirected} phantom(s) redirected (${result.phantomsAmbiguous} ambiguous, ${result.phantomsSkippedDrift} drift-skipped)`
+      : '';
+    return {
+      phase: 'extract_facts',
+      status: result.warnings.length > 0 ? 'warn' : 'ok',
+      duration_ms: 0,
+      summary: `${result.factsInserted} fact(s) reconciled across ${result.pagesScanned} page(s)${phantomSummary}` +
+        (result.warnings.length > 0 ? ` (${result.warnings.length} warning(s))` : ''),
+      details: {
+        pagesScanned: result.pagesScanned,
+        pagesWithFacts: result.pagesWithFacts,
+        factsInserted: result.factsInserted,
+        factsDeleted: result.factsDeleted,
+        warnings: result.warnings.slice(0, 5),
+        // v0.35.5: phantom counters surfaced so extractTotals() can lift
+        // them to CycleReport.totals and the daily report makes the
+        // cleanup visible.
+        phantoms_scanned: result.phantomsScanned,
+        phantoms_redirected: result.phantomsRedirected,
+        phantoms_ambiguous: result.phantomsAmbiguous,
+        phantoms_skipped_drift: result.phantomsSkippedDrift,
+        phantoms_lock_busy: result.phantomsLockBusy,
+        phantoms_more_pending: result.phantomsMorePending,
+      },
+    };
+  } catch (e) {
+    return {
+      phase: 'extract_facts',
+      status: 'fail',
+      duration_ms: 0,
+      summary: 'extract_facts phase failed',
+      details: {},
+      error: makeErrorFromException(e),
+    };
+  }
+}
+
+/**
+ * v0.33.3 W0c — resolve_symbol_edges phase.
+ *
+ * Walks at most BATCH_SIZE*10 chunks per invocation where
+ * `edges_backfilled_at` is NULL or older than EDGE_EXTRACTOR_VERSION_TS.
+ * Resumable across cycles via the watermark; quick-cycle compatible.
+ *
+ * Source scoping: walks every registered source. Pre-v0.33.3 silently
+ * crossed sources; now each source is walked independently so symbol
+ * resolution stays within its source boundary (matches the W0a fix).
+ */
+async function runPhaseResolveSymbolEdges(
+  engine: BrainEngine,
+  dryRun: boolean,
+): Promise<PhaseResult> {
+  if (dryRun) {
+    return {
+      phase: 'resolve_symbol_edges',
+      status: 'skipped',
+      duration_ms: 0,
+      summary: 'dry-run: resolve_symbol_edges phase skipped',
+      details: { dryRun: true, reason: 'no_dry_run_support' },
+    };
+  }
+  try {
+    const { resolveSymbolEdgesIncremental } = await import('./chunkers/symbol-resolver.ts');
+    const { listSources } = await import('./sources-ops.ts');
+    const sources = await listSources(engine);
+    let totalChunks = 0;
+    let totalResolved = 0;
+    let totalAmbiguous = 0;
+    let totalUnmatched = 0;
+    for (const s of sources) {
+      const stats = await resolveSymbolEdgesIncremental(engine, { sourceId: s.id });
+      totalChunks += stats.chunks_walked;
+      totalResolved += stats.edges_resolved;
+      totalAmbiguous += stats.edges_ambiguous;
+      totalUnmatched += stats.edges_unmatched;
+    }
+    return {
+      phase: 'resolve_symbol_edges',
+      status: 'ok',
+      duration_ms: 0,
+      summary:
+        totalChunks === 0
+          ? 'no chunks needed symbol resolution'
+          : `${totalChunks} chunk(s) walked; resolved ${totalResolved}, ambiguous ${totalAmbiguous}, unmatched ${totalUnmatched}`,
+      details: {
+        chunks_walked: totalChunks,
+        edges_resolved: totalResolved,
+        edges_ambiguous: totalAmbiguous,
+        edges_unmatched: totalUnmatched,
+        sources_walked: sources.length,
+      },
+    };
+  } catch (e) {
+    return {
+      phase: 'resolve_symbol_edges',
+      status: 'fail',
+      duration_ms: 0,
+      summary: 'resolve_symbol_edges phase failed',
+      details: {},
+      error: makeErrorFromException(e),
+    };
+  }
+}
+
 async function runPhaseEmbed(engine: BrainEngine, dryRun: boolean): Promise<PhaseResult> {
   try {
     const { runEmbedCore } = await import('../commands/embed.ts');
@@ -997,6 +1183,66 @@ export async function runCycle(
       await safeYield(opts.yieldBetweenPhases);
     }
 
+    // ── Phase 5b: extract_facts (v0.32.2) ───────────────────────
+    // Reconcile DB facts index from the `## Facts` fence on every
+    // affected entity page. Runs AFTER extract (link/timeline
+    // materialization) and BEFORE patterns/recompute_emotional_weight
+    // so downstream phases see fresh DB facts. Empty-fence guard
+    // refuses to run while v0.31 legacy facts are pending the
+    // v0_32_2 backfill (Codex R2-#7).
+    if (phases.includes('extract_facts')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'extract_facts',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.extract_facts');
+        // v0.35.5 (codex #10): thread sourceId so multi-source brains route
+        // the phantom-redirect pass to the right source, and brainDir so
+        // the redirect handler can read/write disk fences. brainDir is the
+        // already-resolved cycle scope; sourceId defaults to 'default' when
+        // the sources table doesn't recognize this brainDir (pre-multi-
+        // source installs).
+        const xfSourceId = (await resolveSourceForDir(engine, opts.brainDir)) ?? 'default';
+        const { result, duration_ms } = await timePhase(() =>
+          runPhaseExtractFacts(engine, opts.brainDir, xfSourceId, dryRun, syncPagesAffected));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
+    // ── v0.33.3 W0c: resolve_symbol_edges (between extract_facts + patterns) ──
+    // Walks chunks whose edges_backfilled_at is null/stale. Resumable
+    // across cycles via the watermark. Quick-cycle compatible — caps at
+    // BATCH_SIZE * 10 chunks per invocation so a 60s watchdog tick stays
+    // responsive even on a 100K-chunk brain.
+    if (phases.includes('resolve_symbol_edges')) {
+      checkAborted(opts.signal);
+      if (!engine) {
+        phaseResults.push({
+          phase: 'resolve_symbol_edges',
+          status: 'skipped',
+          duration_ms: 0,
+          summary: 'no database connected',
+          details: { reason: 'no_database' },
+        });
+      } else {
+        progress.start('cycle.resolve_symbol_edges');
+        const { result, duration_ms } = await timePhase(() => runPhaseResolveSymbolEdges(engine, dryRun));
+        result.duration_ms = duration_ms;
+        phaseResults.push(result);
+        progress.finish();
+      }
+      await safeYield(opts.yieldBetweenPhases);
+    }
+
     // ── Phase 6: patterns (v0.23) ───────────────────────────────
     // MUST run after extract so the graph state reads fresh — subagent
     // put_page calls in synthesize set ctx.remote=true, so auto-link
@@ -1194,10 +1440,15 @@ function emptyTotals(): CycleReport['totals'] {
     synth_pages_written: 0,
     patterns_written: 0,
     pages_emotional_weight_recomputed: 0,
+    edges_resolved: 0,
+    edges_ambiguous: 0,
     purged_sources_count: 0,
     purged_pages_count: 0,
     facts_consolidated: 0,
     consolidate_takes_written: 0,
+    phantoms_redirected: 0,
+    phantoms_ambiguous: 0,
+    phantoms_skipped_drift: 0,
   };
 }
 
@@ -1227,12 +1478,22 @@ function extractTotals(phases: PhaseResult[]): CycleReport['totals'] {
       t.patterns_written = Number(p.details.patterns_written ?? 0);
     } else if (p.phase === 'recompute_emotional_weight' && p.details) {
       t.pages_emotional_weight_recomputed = Number(p.details.pages_recomputed ?? 0);
+    } else if (p.phase === 'resolve_symbol_edges' && p.details) {
+      t.edges_resolved = Number(p.details.edges_resolved ?? 0);
+      t.edges_ambiguous = Number(p.details.edges_ambiguous ?? 0);
     } else if (p.phase === 'purge' && p.details) {
       t.purged_sources_count = Number(p.details.purged_sources_count ?? 0);
       t.purged_pages_count = Number(p.details.purged_pages_count ?? 0);
     } else if (p.phase === 'consolidate' && p.details) {
       t.facts_consolidated = Number(p.details.facts_consolidated ?? 0);
       t.consolidate_takes_written = Number(p.details.takes_written ?? 0);
+    } else if (p.phase === 'extract_facts' && p.details) {
+      // v0.35.5: phantom-redirect counters live inside the extract_facts
+      // phase's details block (the pre-pass runs before the main reconcile
+      // loop and stamps its counts in the same phase result).
+      t.phantoms_redirected = Number(p.details.phantoms_redirected ?? 0);
+      t.phantoms_ambiguous = Number(p.details.phantoms_ambiguous ?? 0);
+      t.phantoms_skipped_drift = Number(p.details.phantoms_skipped_drift ?? 0);
     }
   }
   return t;
